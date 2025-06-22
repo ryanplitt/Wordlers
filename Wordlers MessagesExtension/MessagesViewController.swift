@@ -97,6 +97,37 @@ class FirebaseService {
             .collection("games").document(date)
             .setData(data, completion: completion)
     }
+
+    func addGameListener(threadID: String, date: String,
+                         update: @escaping (WordleGame?, Error?) -> Void) -> ListenerRegistration {
+        db.collection("threads").document(threadID)
+            .collection("games").document(date)
+            .addSnapshotListener { snapshot, error in
+                if let error = error {
+                    update(nil, error)
+                    return
+                }
+
+                guard let data = snapshot?.data() else {
+                    update(nil, nil)
+                    return
+                }
+
+                if let word = data["startingWord"] as? String,
+                   let scores = data["playerScores"] as? [[String: String]] {
+                    let playerScores: [PlayerScore] = scores.compactMap {
+                        guard let id = $0["id"],
+                              let name = $0["name"],
+                              let score = $0["score"] else { return nil }
+                        return PlayerScore(id: id, name: name, score: score)
+                    }
+
+                    update(WordleGame(startingWord: word, playerScores: playerScores), nil)
+                } else {
+                    update(nil, nil)
+                }
+            }
+    }
 }
 
 struct ScoreboardView: View {
@@ -112,9 +143,14 @@ struct ScoreboardView: View {
     @State private var game = WordleGame.sample()
     @State private var errorMessage: String? = nil
     @State private var listener: ListenerRegistration? = nil
+    @State private var editingScore = false
     
     let firebaseService = FirebaseService()
     let possibleScores = ["1", "2", "3", "4", "5", "6", "X"]
+
+    var hasSubmittedScore: Bool {
+        game.playerScores.contains { $0.id == localUserID }
+    }
     
     var threadID: String {
         let allIDs = ([conversation.localParticipantIdentifier] + conversation.remoteParticipantIdentifiers)
@@ -165,24 +201,35 @@ struct ScoreboardView: View {
                 Text("Starting Word: \(game.startingWord)")
                     .font(.subheadline)
                     .foregroundColor(.gray)
-                
-                ScoreListView(playerScores: game.playerScores)
-                
+
+                ScoreListView(playerScores: game.playerScores.sorted { $0.name < $1.name })
+
                 Divider()
-                
-                Button("Change My Name") {
-                    currentPlayerName = storedDisplayName
+
+                if hasSubmittedScore && !editingScore {
+                    Button("Edit My Score/Name") {
+                        editingScore = true
+                        if let me = game.playerScores.first(where: { $0.id == localUserID }) {
+                            currentPlayerName = me.name
+                            selectedScore = me.score
+                        }
+                    }
+                    .font(.caption)
+                    .padding(.bottom, 4)
                 }
-                .font(.caption)
-                .padding(.bottom, 4)
-                
-                ScoreInputView(
-                    currentPlayerName: $currentPlayerName,
-                    selectedScore: $selectedScore,
-                    possibleScores: possibleScores,
-                    onSubmit: submitScore
-                )
-                .padding()
+
+                if !hasSubmittedScore || editingScore {
+                    ScoreInputView(
+                        currentPlayerName: $currentPlayerName,
+                        selectedScore: $selectedScore,
+                        possibleScores: possibleScores,
+                        onSubmit: {
+                            submitScore()
+                            editingScore = false
+                        }
+                    )
+                    .padding()
+                }
             } else {
                 Text("Start a New Wordle Game")
                     .font(.title2)
@@ -212,7 +259,8 @@ struct ScoreboardView: View {
     }
     
     func listenForGameUpdates() {
-        firebaseService.fetchGame(threadID: threadID, date: formattedDate) { fetchedGame, error in
+        listener?.remove()
+        listener = firebaseService.addGameListener(threadID: threadID, date: formattedDate) { fetchedGame, error in
             if let error = error {
                 errorMessage = "Failed to fetch game: \(error.localizedDescription)"
                 return
@@ -229,7 +277,9 @@ struct ScoreboardView: View {
     
     func submitScore() {
         guard !currentPlayerName.isEmpty else { return }
-        
+
+        storedDisplayName = currentPlayerName
+
         if let index = game.playerScores.firstIndex(where: { $0.id == localUserID }) {
             game.playerScores[index].score = selectedScore
             game.playerScores[index].name = storedDisplayName
